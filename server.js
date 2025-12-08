@@ -131,7 +131,7 @@ app.get('/analyze', async (req, res) => {
     const wants = data.wants || [];
     if (wants.length === 0) return res.status(404).json({ error: 'Wantlist is empty' });
 
-    const toCheck = wants.slice(0, 20); // 🔥 version stable : analyse les 20 premiers items
+    const toCheck = wants.slice(0, 50); // 🔥 version stable : analyse les 20 premiers items
     const vendorCount = {};
 
     for (const want of toCheck) {
