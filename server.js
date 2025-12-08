@@ -4,24 +4,27 @@ import * as cheerio from 'cheerio';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const SCRAPINGBEE_KEY = 'BWGUROFAWKOCERBQY5DZF2CNOH5TNEKFY4Z9TRGYPO2UQA3C5I8Z5EW5DJRLQBRGU0D201KEDGK59IWE';
 
 app.use(cors({ origin: '*' }));
 app.use(express.json());
 
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', message: 'Discogs Backend API' });
+  res.json({ status: 'ok', message: 'Discogs Backend API with ScrapingBee' });
 });
 
 async function scrapeMarketplace(releaseId) {
   try {
-    const url = `https://www.discogs.com/sell/release/${releaseId}?sort=price,asc`;
-    const response = await fetch(url, {
-      headers: { 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36' }
-    });
+    const targetUrl = `https://www.discogs.com/sell/release/${releaseId}?sort=price,asc`;
+    const apiUrl = `https://app.scrapingbee.com/api/v1/?api_key=${SCRAPINGBEE_KEY}&url=${encodeURIComponent(targetUrl)}&render_js=false`;
+    
+    const response = await fetch(apiUrl);
     if (!response.ok) return [];
+    
     const html = await response.text();
     const $ = cheerio.load(html);
     const sellers = [];
+    
     $('a[href*="/seller/"]').each((i, el) => {
       const href = $(el).attr('href');
       if (href) {
@@ -31,6 +34,7 @@ async function scrapeMarketplace(releaseId) {
     });
     return sellers;
   } catch (err) {
+    console.log('Scrape error:', err.message);
     return [];
   }
 }
@@ -55,14 +59,14 @@ app.get('/analyze', async (req, res) => {
     if (wants.length === 0) return res.status(404).json({ error: 'Wantlist is empty' });
 
     const vendorCount = {};
-    const toCheck = wants.slice(0, 25);
+    const toCheck = wants.slice(0, 20);
 
     for (const want of toCheck) {
       const sellers = await scrapeMarketplace(want.id);
       for (const seller of sellers) {
         vendorCount[seller] = (vendorCount[seller] || 0) + 1;
       }
-      await new Promise(r => setTimeout(r, 500));
+      await new Promise(r => setTimeout(r, 300));
     }
 
     const vendors = Object.entries(vendorCount)
