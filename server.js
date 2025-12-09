@@ -415,7 +415,7 @@ app.all('/analyze', async (req, res) => {
         });
 
         // Rate limiting
-        await new Promise(resolve => setTimeout(resolve, 500));
+        await new Promise(resolve => setTimeout(resolve, 150));
 
       } catch (error) {
         console.error(`❌ Error processing item: ${error.message}`);
