@@ -1,505 +1,395 @@
-import express from 'express';
-import cors from 'cors';
-import Stripe from 'stripe';
+const express = require('express');
+const cors = require('cors');
+const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Stripe setup
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || 'sk_test_dummy');
-const PRICE_IDS = {
-  pro: process.env.STRIPE_PRO_PRICE_ID,
-  collector: process.env.STRIPE_COLLECTOR_PRICE_ID
-};
-
-// PLUS BESOIN DE SCRAPINGBEE !
-const DISCOGS_TOKEN = process.env.DISCOGS_TOKEN;
-
-if (!DISCOGS_TOKEN) {
-  console.warn('⚠️  WARNING: No DISCOGS_TOKEN set. Rate limit will be 60 req/min instead of 1000 req/min');
-}
-
-const CONDITIONS = { 'P': 1, 'F': 2, 'G': 3, 'G+': 4, 'VG': 5, 'VG+': 6, 'NM': 7, 'M': 8 };
-
-const REGIONS = {
-  'us': ['United States', 'USA', 'US'],
-  'uk': ['United Kingdom', 'UK', 'Great Britain'],
-  'eu': ['Germany', 'France', 'Italy', 'Spain', 'Netherlands', 'Belgium', 'Austria', 'Poland', 'Sweden', 'Portugal', 'Greece', 'Ireland', 'Switzerland', 'Czech Republic', 'Denmark', 'Finland', 'Norway'],
-  'jp': ['Japan'],
-  'au': ['Australia', 'New Zealand'],
-  'ca': ['Canada'],
-  'asia': ['Japan', 'South Korea', 'Singapore', 'Hong Kong', 'Taiwan', 'Thailand'],
-  'latam': ['Mexico', 'Brazil', 'Argentina', 'Chile', 'Colombia']
-};
-
-app.use(cors({ origin: '*' }));
+// Middleware
+app.use(cors());
 app.use(express.json());
 
-// Rate Limiter
-class RateLimiter {
-  constructor(maxPerMinute = 60) {
-    this.maxPerMinute = maxPerMinute;
-    this.queue = [];
+// Discogs API Configuration
+const DISCOGS_TOKEN = process.env.DISCOGS_TOKEN;
+const DISCOGS_API = 'https://api.discogs.com';
+
+// Helper: Fetch with Discogs API
+async function discogsAPI(endpoint, params = {}) {
+  const url = new URL(`${DISCOGS_API}${endpoint}`);
+  
+  // Add token if available
+  if (DISCOGS_TOKEN) {
+    url.searchParams.append('token', DISCOGS_TOKEN);
   }
   
-  async throttle() {
-    const now = Date.now();
-    this.queue = this.queue.filter(time => now - time < 60000);
-    
-    if (this.queue.length >= this.maxPerMinute) {
-      const oldestRequest = this.queue[0];
-      const waitTime = 60000 - (now - oldestRequest) + 100;
-      await new Promise(r => setTimeout(r, waitTime));
-      return this.throttle();
-    }
-    
-    this.queue.push(Date.now());
-  }
-  
-  getStats() {
-    const now = Date.now();
-    const recent = this.queue.filter(time => now - time < 60000);
-    return {
-      requestsLastMinute: recent.length,
-      limit: this.maxPerMinute,
-      available: this.maxPerMinute - recent.length
-    };
-  }
-}
-
-const rateLimiter = new RateLimiter(DISCOGS_TOKEN ? 1000 : 60);
-
-function matchesRegion(location, regionFilter) {
-  if (!regionFilter || !location) return true;
-  const countries = REGIONS[regionFilter.toLowerCase()];
-  if (!countries) return true;
-  return countries.some(c => location.toLowerCase().includes(c.toLowerCase()));
-}
-
-function meetsCondition(itemCondition, minCondition) {
-  if (!minCondition || !itemCondition) return true;
-  return CONDITIONS[itemCondition] >= CONDITIONS[minCondition];
-}
-
-async function getMarketplaceSellersDetailed(releaseId, filters = {}) {
-  try {
-    await rateLimiter.throttle();
-    
-    const url = `https://api.discogs.com/marketplace/listings?release_id=${releaseId}&per_page=100`;
-    
-    const headers = {
-      'User-Agent': 'WantlistOptimizer/2.0'
-    };
-    
-    if (DISCOGS_TOKEN) {
-      headers['Authorization'] = `Discogs token=${DISCOGS_TOKEN}`;
-    }
-    
-    const response = await fetch(url, { headers });
-    
-    if (!response.ok) {
-      if (response.status === 429) {
-        console.log('⚠️  Rate limited, waiting...');
-        await new Promise(r => setTimeout(r, 2000));
-        return getMarketplaceSellersDetailed(releaseId, filters);
-      }
-      return [];
-    }
-    
-    const data = await response.json();
-    const listings = data.listings || [];
-    
-    const sellersData = [];
-    
-    for (const listing of listings) {
-      const seller = listing.seller?.username;
-      if (!seller) continue;
-      
-      const { minCondition, minSleeveCondition, region, minRating, maxPrice } = filters;
-      
-      if (minCondition && listing.condition) {
-        if (!meetsCondition(listing.condition, minCondition)) continue;
-      }
-      
-      if (minSleeveCondition && listing.sleeve_condition) {
-        if (!meetsCondition(listing.sleeve_condition, minSleeveCondition)) continue;
-      }
-      
-      if (region && listing.seller?.location) {
-        if (!matchesRegion(listing.seller.location, region)) continue;
-      }
-      
-      if (minRating && listing.seller?.rating) {
-        if (parseFloat(listing.seller.rating) < minRating) continue;
-      }
-      
-      if (maxPrice && listing.price?.value) {
-        if (parseFloat(listing.price.value) > maxPrice) continue;
-      }
-      
-      const sellerData = {
-        seller: seller,
-        price: listing.price?.value || 0,
-        currency: listing.price?.currency || 'USD',
-        condition: listing.condition || 'Unknown',
-        sleeveCondition: listing.sleeve_condition || 'Unknown',
-        location: listing.seller?.location || 'Unknown',
-        rating: listing.seller?.rating || 0,
-        rating_count: listing.seller?.num_ratings || 0,
-        ships_from: listing.ships_from || listing.seller?.location || 'Unknown',
-        uri: listing.uri || '',
-        comments: listing.comments || ''
-      };
-      
-      sellersData.push(sellerData);
-    }
-    
-    return sellersData;
-    
-  } catch (err) {
-    console.error('Marketplace fetch error:', err.message);
-    return [];
-  }
-}
-
-async function analyzeWantlistParallel(wantlist, filters = {}, maxItems = null) {
-  const toAnalyze = maxItems ? wantlist.slice(0, maxItems) : wantlist;
-  
-  const BATCH_SIZE = DISCOGS_TOKEN ? 20 : 10;
-  const BATCH_DELAY = DISCOGS_TOKEN ? 1200 : 10000;
-  
-  const vendorDetails = {};
-  
-  console.log(`🚀 Analyzing ${toAnalyze.length} items (batch size: ${BATCH_SIZE})`);
-  
-  for (let i = 0; i < toAnalyze.length; i += BATCH_SIZE) {
-    const batch = toAnalyze.slice(i, i + BATCH_SIZE);
-    const batchNum = Math.floor(i / BATCH_SIZE) + 1;
-    const totalBatches = Math.ceil(toAnalyze.length / BATCH_SIZE);
-    
-    console.log(`📦 Processing batch ${batchNum}/${totalBatches} (items ${i + 1}-${i + batch.length})`);
-    
-    const results = await Promise.all(
-      batch.map(want => getMarketplaceSellersDetailed(want.id, filters))
-    );
-    
-    results.forEach((sellersData, idx) => {
-      const want = batch[idx];
-      
-      for (const sellerData of sellersData) {
-        const seller = sellerData.seller;
-        
-        if (!vendorDetails[seller]) {
-          vendorDetails[seller] = {
-            seller: seller,
-            count: 0,
-            listings: [],
-            totalPrice: 0,
-            avgPrice: 0,
-            location: sellerData.location,
-            rating: sellerData.rating,
-            rating_count: sellerData.rating_count
-          };
-        }
-        
-        vendorDetails[seller].count += 1;
-        vendorDetails[seller].totalPrice += parseFloat(sellerData.price) || 0;
-        vendorDetails[seller].listings.push({
-          releaseId: want.id,
-          releaseTitle: want.basic_information?.title || 'Unknown',
-          price: sellerData.price,
-          currency: sellerData.currency,
-          condition: sellerData.condition,
-          sleeveCondition: sellerData.sleeveCondition,
-          uri: sellerData.uri
-        });
-      }
-    });
-    
-    if (i + BATCH_SIZE < toAnalyze.length) {
-      const stats = rateLimiter.getStats();
-      console.log(`⏳ Rate limit: ${stats.requestsLastMinute}/${stats.limit} req/min, waiting ${BATCH_DELAY}ms...`);
-      await new Promise(r => setTimeout(r, BATCH_DELAY));
-    }
-  }
-  
-  const vendors = Object.values(vendorDetails).map(v => ({
-    ...v,
-    avgPrice: v.count > 0 ? (v.totalPrice / v.count).toFixed(2) : 0,
-    estimatedTotal: (v.totalPrice + (v.count * 5)).toFixed(2),
-    savingsVsMultiple: 0
-  })).sort((a, b) => b.count - a.count);
-  
-  if (vendors.length > 0) {
-    const topVendor = vendors[0];
-    const shippingPerOrder = 5;
-    const totalIfSeparate = toAnalyze.length * shippingPerOrder;
-    const totalWithTopVendor = shippingPerOrder;
-    const savings = totalIfSeparate - totalWithTopVendor;
-    
-    vendors[0].estimatedSavings = savings.toFixed(2);
-  }
-  
-  return vendors;
-}
-
-app.get('/', (req, res) => {
-  res.json({ 
-    status: 'ok', 
-    message: 'WantlistOptimizer API v2.0',
-    cost: '0€/month (using Discogs API directly)',
-    rateLimit: DISCOGS_TOKEN ? '1000 req/min' : '60 req/min'
+  // Add other params
+  Object.keys(params).forEach(key => {
+    url.searchParams.append(key, params[key]);
   });
-});
 
-app.get('/status', (req, res) => {
-  const stats = rateLimiter.getStats();
+  const response = await fetch(url.toString(), {
+    headers: {
+      'User-Agent': 'WantlistOptimizer/2.0'
+    }
+  });
+
+  if (!response.ok) {
+    throw new Error(`Discogs API error: ${response.status}`);
+  }
+
+  return response.json();
+}
+
+// Helper: Fisher-Yates shuffle
+function shuffleArray(array) {
+  const shuffled = [...array];
+  for (let i = shuffled.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+  }
+  return shuffled;
+}
+
+// Status endpoint
+app.get('/status', async (req, res) => {
+  const hasToken = !!DISCOGS_TOKEN;
+  const rateLimit = hasToken ? 1000 : 60;
+  
   res.json({
     status: 'ok',
-    hasToken: !!DISCOGS_TOKEN,
+    hasToken,
     rateLimit: {
-      max: stats.limit,
-      used: stats.requestsLastMinute,
-      available: stats.available
+      max: rateLimit,
+      used: 0,
+      available: rateLimit
     },
     cost: '0€/month 🎉'
   });
 });
 
-app.get('/analyze', async (req, res) => {
-  const { 
-    username, 
-    plan = 'free',
-    minCondition,
-    minSleeveCondition, 
-    region,
-    minRating,
-    maxPrice,
-    genre,
-    yearMin,
-    yearMax,
-    format
-  } = req.query;
-  
+// Main analyze endpoint
+app.post('/analyze', async (req, res) => {
+  const startTime = Date.now();
+  const { username, plan = 'free' } = req.body;
+
   if (!username) {
-    return res.status(400).json({ error: 'Username required' });
+    return res.status(400).json({ error: 'Username is required' });
   }
 
-  try {
-    console.log(`\n🎵 Analyzing wantlist for: ${username} (plan: ${plan})`);
-    
-    const wantlistRes = await fetch(
-      `https://api.discogs.com/users/${encodeURIComponent(username)}/wants?per_page=100`,
-      { 
-        headers: { 
-          'User-Agent': 'WantlistOptimizer/2.0',
-          ...(DISCOGS_TOKEN ? { 'Authorization': `Discogs token=${DISCOGS_TOKEN}` } : {})
-        } 
-      }
-    );
+  console.log(`\n🎵 ===================================`);
+  console.log(`📊 New Analysis Request`);
+  console.log(`👤 Username: ${username}`);
+  console.log(`💎 Plan: ${plan.toUpperCase()}`);
+  console.log(`🎵 ===================================\n`);
 
-    if (!wantlistRes.ok) {
-      if (wantlistRes.status === 404) {
-        return res.status(404).json({ error: 'User not found' });
+  try {
+    // Plan limits
+    const limits = {
+      free: 200,
+      pro: 1000,
+      collector: Infinity
+    };
+    const maxItems = limits[plan] || limits.free;
+
+    // Step 1: Fetch wantlist
+    console.log(`📥 Fetching wantlist for ${username}...`);
+    
+    let allWants = [];
+    let page = 1;
+    let hasMore = true;
+
+    while (hasMore) {
+      const data = await discogsAPI(`/users/${username}/wants`, {
+        page,
+        per_page: 100
+      });
+
+      allWants = allWants.concat(data.wants);
+      
+      if (data.pagination.page >= data.pagination.pages) {
+        hasMore = false;
+      } else {
+        page++;
       }
-      return res.status(wantlistRes.status).json({ error: 'Cannot access wantlist' });
     }
 
-    const data = await wantlistRes.json();
-    let wants = data.wants || [];
-    
-    if (wants.length === 0) {
+    if (allWants.length === 0) {
       return res.status(404).json({ error: 'Wantlist is empty' });
     }
 
-    console.log(`📊 Wantlist size: ${wants.length} items`);
+    console.log(`✅ Wantlist loaded: ${allWants.length} total items`);
 
-    if (genre || yearMin || yearMax || format) {
-      wants = wants.filter(want => {
-        const info = want.basic_information;
-        
-        if (genre && info.genres) {
-          if (!info.genres.some(g => g.toLowerCase().includes(genre.toLowerCase()))) {
-            return false;
-          }
-        }
-        
-        if (yearMin && info.year && info.year < parseInt(yearMin)) return false;
-        if (yearMax && info.year && info.year > parseInt(yearMax)) return false;
-        
-        if (format && info.formats) {
-          if (!info.formats.some(f => f.name.toLowerCase().includes(format.toLowerCase()))) {
-            return false;
-          }
-        }
-        
-        return true;
-      });
+    // Step 2: Apply randomization and limits
+    let wantsToAnalyze = allWants;
+    let wasRandomized = false;
+
+    if (plan !== 'collector' && allWants.length > maxItems) {
+      console.log(`🎲 Randomizing ${maxItems} items from ${allWants.length} total`);
+      wantsToAnalyze = shuffleArray(allWants).slice(0, maxItems);
+      wasRandomized = true;
+    } else if (allWants.length > maxItems) {
+      wantsToAnalyze = allWants.slice(0, maxItems);
+    }
+
+    console.log(`🔍 Analyzing ${wantsToAnalyze.length} items...`);
+
+    // Step 3: Fetch marketplace listings for each item
+    const vendorMap = {};
+    const itemDetails = [];
+    let processedCount = 0;
+
+    for (const want of wantsToAnalyze) {
+      processedCount++;
       
-      console.log(`🔍 After filters: ${wants.length} items`);
+      if (processedCount % 10 === 0) {
+        console.log(`📊 Progress: ${processedCount}/${wantsToAnalyze.length}`);
+      }
+
+      try {
+        const releaseId = want.basic_information.id;
+        const releaseTitle = want.basic_information.title;
+        const releaseArtist = want.basic_information.artists?.[0]?.name || 'Unknown';
+
+        // Fetch marketplace listings
+        const marketplaceData = await discogsAPI('/marketplace/search', {
+          release_id: releaseId,
+          per_page: 100
+        });
+
+        const listings = marketplaceData.results || [];
+
+        // Count items per vendor
+        listings.forEach(listing => {
+          const vendorName = listing.seller?.username;
+          if (!vendorName) return;
+
+          if (!vendorMap[vendorName]) {
+            vendorMap[vendorName] = {
+              username: vendorName,
+              count: 0,
+              items: [],
+              totalPrice: 0
+            };
+          }
+
+          vendorMap[vendorName].count++;
+          vendorMap[vendorName].items.push({
+            title: releaseTitle,
+            artist: releaseArtist,
+            price: listing.price?.value || 0,
+            condition: listing.condition || 'Unknown'
+          });
+          vendorMap[vendorName].totalPrice += (listing.price?.value || 0);
+        });
+
+        itemDetails.push({
+          id: releaseId,
+          title: releaseTitle,
+          artist: releaseArtist,
+          listingsFound: listings.length
+        });
+
+        // Rate limiting: 1000 req/min = ~60ms between requests
+        await new Promise(resolve => setTimeout(resolve, 70));
+
+      } catch (error) {
+        console.error(`❌ Error fetching item ${want.basic_information.id}:`, error.message);
+      }
     }
 
-    let maxItems;
-    switch(plan) {
-      case 'free':
-        maxItems = 200;
-        break;
-      case 'pro':
-        maxItems = 1000;
-        break;
-      case 'collector':
-        maxItems = 20000;
-        break;
-      default:
-        maxItems = 200;
-    }
+    console.log(`✅ Analysis complete!`);
 
-    if (wants.length > maxItems) {
-      return res.status(400).json({ 
-        error: `Wantlist too large (${wants.length} items). Plan ${plan} limited to ${maxItems} items.`,
-        upgradeRequired: true,
-        currentSize: wants.length,
-        planLimit: maxItems
-      });
-    }
+    // Step 4: Sort vendors by count
+    const vendors = Object.values(vendorMap)
+      .sort((a, b) => b.count - a.count)
+      .map((vendor, index) => ({
+        rank: index + 1,
+        username: vendor.username,
+        count: vendor.count,
+        percentage: ((vendor.count / wantsToAnalyze.length) * 100).toFixed(1),
+        averagePrice: (vendor.totalPrice / vendor.count).toFixed(2),
+        totalPrice: vendor.totalPrice.toFixed(2),
+        estimatedSavings: (15 * (vendor.count - 1)).toFixed(2), // $15 shipping saved per combined item
+        items: vendor.items.slice(0, 10) // Top 10 items
+      }));
 
-    const filters = {
-      minCondition: minCondition || null,
-      minSleeveCondition: minSleeveCondition || null,
-      region: region || null,
-      minRating: minRating ? parseFloat(minRating) : null,
-      maxPrice: maxPrice ? parseFloat(maxPrice) : null
-    };
-
-    const startTime = Date.now();
-    const vendors = await analyzeWantlistParallel(wants, filters, maxItems);
     const duration = ((Date.now() - startTime) / 1000).toFixed(1);
 
-    if (vendors.length === 0) {
-      return res.status(404).json({ error: 'No sellers found matching your criteria' });
-    }
+    console.log(`\n🎉 Results:`);
+    console.log(`   Top vendor: ${vendors[0]?.username} with ${vendors[0]?.count} items`);
+    console.log(`   Total vendors found: ${vendors.length}`);
+    console.log(`   Processing time: ${duration}s`);
+    console.log(`🎵 ===================================\n`);
 
-    console.log(`✅ Analysis complete in ${duration}s - Found ${vendors.length} sellers`);
-
+    // Step 5: Return results
     res.json({
+      success: true,
       username,
       plan,
-      totalWants: wants.length,
-      analyzedWants: Math.min(wants.length, maxItems),
+      totalWants: allWants.length,
+      analyzedWants: wantsToAnalyze.length,
+      randomized: wasRandomized,
       processingTime: `${duration}s`,
-      filters: filters,
-      topVendor: vendors[0],
+      topVendor: vendors[0] || null,
       vendors: vendors.slice(0, 50),
       estimatedSavings: vendors[0]?.estimatedSavings || 0,
       stats: {
         totalSellers: vendors.length,
-        avgItemsPerSeller: (vendors.reduce((sum, v) => sum + v.count, 0) / vendors.length).toFixed(1),
-        bestSellerHas: `${vendors[0]?.count}/${wants.length} items (${((vendors[0]?.count / wants.length) * 100).toFixed(1)}%)`
-      }
+        avgItemsPerSeller: vendors.length > 0 
+          ? (vendors.reduce((sum, v) => sum + v.count, 0) / vendors.length).toFixed(1)
+          : 0,
+        bestSellerHas: vendors[0] 
+          ? `${vendors[0].count}/${wantsToAnalyze.length} items (${vendors[0].percentage}%)`
+          : 'N/A'
+      },
+      message: wasRandomized 
+        ? `Analyzed ${wantsToAnalyze.length} random items from your ${allWants.length} item wantlist. Results will vary each search. Upgrade to COLLECTOR to analyze ALL items and find THE optimal seller.`
+        : null
     });
 
-  } catch (err) {
-    console.error('❌ Error:', err);
-    res.status(500).json({ error: 'Server error', details: err.message });
+  } catch (error) {
+    console.error('❌ Analysis error:', error);
+    res.status(500).json({ 
+      error: 'Analysis failed', 
+      details: error.message 
+    });
   }
 });
 
-// STRIPE ROUTES
+// Stripe: Create checkout session
 app.post('/create-checkout-session', async (req, res) => {
   const { plan, userEmail, userId } = req.body;
-  
+
   if (!plan || !userEmail) {
-    return res.status(400).json({ error: 'Plan and email required' });
+    return res.status(400).json({ error: 'Missing required fields' });
   }
-  
-  const priceId = PRICE_IDS[plan];
+
+  const priceIds = {
+    pro: process.env.STRIPE_PRO_PRICE_ID,
+    collector: process.env.STRIPE_COLLECTOR_PRICE_ID
+  };
+
+  const priceId = priceIds[plan];
   if (!priceId) {
     return res.status(400).json({ error: 'Invalid plan' });
   }
-  
+
   try {
     const session = await stripe.checkout.sessions.create({
-      mode: 'subscription',
       payment_method_types: ['card'],
-      line_items: [
-        {
-          price: priceId,
-          quantity: 1,
-        },
-      ],
-      success_url: `${process.env.FRONTEND_URL || 'http://localhost:3001'}/success?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${process.env.FRONTEND_URL || 'http://localhost:3001'}/pricing`,
+      line_items: [{
+        price: priceId,
+        quantity: 1,
+      }],
+      mode: 'subscription',
+      success_url: `${process.env.FRONTEND_URL}/success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${process.env.FRONTEND_URL}/#pricing`,
       customer_email: userEmail,
       client_reference_id: userId,
       metadata: {
-        userId: userId || 'guest',
-        plan: plan
-      },
-      subscription_data: {
-        metadata: {
-          userId: userId || 'guest',
-          plan: plan
-        }
+        plan: plan,
+        userId: userId
       }
     });
 
-    res.json({ sessionId: session.id, url: session.url });
+    res.json({ url: session.url });
   } catch (error) {
-    console.error('Error creating checkout session:', error);
-    res.status(500).json({ error: 'Failed to create checkout session' });
+    console.error('Stripe error:', error);
+    res.status(500).json({ error: error.message });
   }
 });
 
-app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+// Stripe: Webhook
+app.post('/webhook', express.raw({ type: 'application/json' }), (req, res) => {
   const sig = req.headers['stripe-signature'];
-  const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
-  
   let event;
-  
+
   try {
-    event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret);
+    event = stripe.webhooks.constructEvent(
+      req.body,
+      sig,
+      process.env.STRIPE_WEBHOOK_SECRET
+    );
   } catch (err) {
     console.error('Webhook signature verification failed:', err.message);
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
+
+  console.log('Webhook received:', event.type);
+
+  switch (event.type) {
+    case 'checkout.session.completed':
+      const session = event.data.object;
+      console.log('Payment successful for:', session.customer_email);
+      break;
+    case 'customer.subscription.updated':
+    case 'customer.subscription.deleted':
+      console.log('Subscription updated:', event.data.object.id);
+      break;
+    case 'invoice.payment_failed':
+      console.log('Payment failed:', event.data.object.customer_email);
+      break;
+  }
+
+  res.json({ received: true });
+});
+
+// Stripe: Get subscription status
+app.get('/subscription-status', async (req, res) => {
+  const { userId } = req.query;
   
+  if (!userId) {
+    return res.status(400).json({ error: 'userId required' });
+  }
+
   try {
-    switch (event.type) {
-      case 'checkout.session.completed':
-        const session = event.data.object;
-        console.log('✅ Payment successful!');
-        console.log('User:', session.metadata.userId);
-        console.log('Plan:', session.metadata.plan);
-        console.log('Customer:', session.customer);
-        break;
-        
-      case 'customer.subscription.updated':
-        console.log('📝 Subscription updated');
-        break;
-        
-      case 'customer.subscription.deleted':
-        console.log('❌ Subscription cancelled');
-        break;
-        
-      case 'invoice.payment_failed':
-        console.log('⚠️  Payment failed');
-        break;
+    const subscriptions = await stripe.subscriptions.list({
+      limit: 1,
+      customer: userId
+    });
+
+    if (subscriptions.data.length === 0) {
+      return res.json({ plan: 'free', status: 'inactive' });
     }
-    
-    res.json({ received: true });
+
+    const sub = subscriptions.data[0];
+    res.json({
+      plan: sub.metadata.plan || 'pro',
+      status: sub.status,
+      currentPeriodEnd: sub.current_period_end
+    });
   } catch (error) {
-    console.error('Error handling webhook:', error);
-    res.status(500).json({ error: 'Webhook handler failed' });
+    res.status(500).json({ error: error.message });
   }
 });
 
+// Stripe: Create portal session
+app.post('/create-portal-session', async (req, res) => {
+  const { customerId } = req.body;
+
+  try {
+    const session = await stripe.billingPortal.sessions.create({
+      customer: customerId,
+      return_url: process.env.FRONTEND_URL,
+    });
+
+    res.json({ url: session.url });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Start server
 app.listen(PORT, () => {
+  const hasToken = !!DISCOGS_TOKEN;
+  const rateLimit = hasToken ? 1000 : 60;
+  
   console.log('\n🎵 ===================================');
   console.log('🚀 WantlistOptimizer API v2.0');
   console.log('🎵 ===================================');
   console.log(`📡 Server: http://localhost:${PORT}`);
   console.log(`💰 Cost: 0€/month (Discogs API direct)`);
-  console.log(`⚡ Rate: ${DISCOGS_TOKEN ? '1000' : '60'} req/min`);
-  console.log(`🔑 Token: ${DISCOGS_TOKEN ? '✅ Active' : '⚠️  Missing (performance degraded)'}`);
+  console.log(`⚡ Rate: ${rateLimit} req/min`);
+  console.log(`🔑 Token: ${hasToken ? '✅ Active' : '⚠️  Missing (performance degraded)'}`);
   console.log('🎵 ===================================\n');
 });
