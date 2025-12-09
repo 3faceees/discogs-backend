@@ -60,6 +60,12 @@ app.post('/create-checkout-session', async (req, res) => {
   try {
     const { plan, email } = req.body;
     
+    console.log('📧 Checkout request:', { plan, email });
+    
+    if (!email) {
+      return res.status(400).json({ error: 'Email is required' });
+    }
+    
     if (!PLANS[plan] || plan === 'free') {
       return res.status(400).json({ error: 'Invalid plan' });
     }
@@ -72,14 +78,16 @@ app.post('/create-checkout-session', async (req, res) => {
       }],
       mode: 'subscription',
       success_url: `${req.headers.origin}/success?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${req.headers.origin}/app`,
+      cancel_url: `${req.headers.origin}/#pricing`,
       customer_email: email,
       metadata: { plan: plan, email: email }
     });
 
+    console.log('✅ Stripe session created:', session.id);
     res.json({ sessionId: session.id, url: session.url });
+    
   } catch (error) {
-    console.error('Stripe error:', error);
+    console.error('❌ Stripe error:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -91,7 +99,7 @@ app.post('/webhook', express.raw({type: 'application/json'}), async (req, res) =
   try {
     event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
   } catch (err) {
-    console.error('Webhook error:', err.message);
+    console.error('❌ Webhook error:', err.message);
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
@@ -194,6 +202,7 @@ app.all('/analyze', async (req, res) => {
 
     console.log(`💎 Plan: ${userPlan} (limit: ${itemsLimit} items)`);
 
+    // Fetch wantlist
     let allWants = [];
     let page = 1;
     let hasMore = true;
@@ -231,6 +240,7 @@ app.all('/analyze', async (req, res) => {
       });
     }
 
+    // Randomize items
     let wantsToAnalyze = allWants;
     let isPreview = (userPlan === 'free');
 
@@ -244,6 +254,7 @@ app.all('/analyze', async (req, res) => {
 
     console.log(`🔍 Analyzing ${wantsToAnalyze.length} items...`);
 
+    // Scrape marketplace
     const vendorMap = {};
     let processedCount = 0;
 
@@ -265,17 +276,40 @@ app.all('/analyze', async (req, res) => {
         const response = await fetch(scrapingBeeUrl);
         
         if (!response.ok) {
-          console.error(`❌ ScrapingBee error: ${response.status}`);
+          console.error(`❌ ScrapingBee error for ${releaseId}: ${response.status}`);
           continue;
         }
         
         const html = await response.text();
 
-        const sellerMatches = html.matchAll(/data-seller-username="([^"]+)"/g);
-        const priceMatches = html.matchAll(/data-price="([^"]+)"/g);
+        // FIX: Multiple patterns to find sellers
+        let sellers = [];
         
-        const sellers = Array.from(sellerMatches).map(m => m[1]);
+        // Pattern 1: data-seller-username
+        const pattern1 = html.matchAll(/data-seller-username="([^"]+)"/g);
+        sellers = Array.from(pattern1).map(m => m[1]);
+        
+        // Pattern 2: /seller/ links (fallback)
+        if (sellers.length === 0) {
+          const pattern2 = html.matchAll(/\/seller\/([^\/"\s]+)/g);
+          sellers = Array.from(pattern2).map(m => m[1]);
+        }
+        
+        // Pattern 3: user profiles (fallback)
+        if (sellers.length === 0) {
+          const pattern3 = html.matchAll(/\/user\/([^\/"\s]+)/g);
+          sellers = Array.from(pattern3).map(m => m[1]);
+        }
+
+        // Get prices
+        const priceMatches = html.matchAll(/data-price="([^"]+)"/g);
         const prices = Array.from(priceMatches).map(m => parseFloat(m[1]));
+
+        if (sellers.length > 0) {
+          console.log(`✅ Found ${sellers.length} sellers for: ${releaseTitle}`);
+        } else {
+          console.log(`⚠️ No sellers for: ${releaseTitle}`);
+        }
 
         sellers.forEach((seller, idx) => {
           if (!vendorMap[seller]) {
@@ -296,17 +330,21 @@ app.all('/analyze', async (req, res) => {
           vendorMap[seller].totalPrice += (prices[idx] || 0);
         });
 
-        await new Promise(resolve => setTimeout(resolve, 100));
+        await new Promise(resolve => setTimeout(resolve, 150));
 
       } catch (error) {
-        console.error(`❌ Error: ${error.message}`);
+        console.error(`❌ Error processing item: ${error.message}`);
       }
     }
 
+    // Sort results
     const sortedSellers = Object.values(vendorMap)
       .sort((a, b) => b.count - a.count)
       .slice(0, isPreview ? 3 : 20);
 
+    console.log(`📊 Total sellers found: ${sortedSellers.length}`);
+
+    // Lock data for FREE preview
     if (isPreview) {
       sortedSellers.forEach(seller => {
         seller.items = [];
@@ -316,9 +354,9 @@ app.all('/analyze', async (req, res) => {
     }
 
     const duration = ((Date.now() - startTime) / 1000).toFixed(1);
-
     console.log(`✅ Complete in ${duration}s\n`);
 
+    // Save analysis
     if (email) {
       const analyses = userAnalyses.get(email) || [];
       analyses.push({
