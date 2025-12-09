@@ -1,145 +1,264 @@
+cat > server.js << 'EOF'
 const express = require('express');
 const cors = require('cors');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 8080;
 
-// Middleware
 app.use(cors());
 app.use(express.json());
 
-// Discogs API Configuration
 const DISCOGS_TOKEN = process.env.DISCOGS_TOKEN;
 const DISCOGS_API = 'https://api.discogs.com';
+const SCRAPINGBEE_API_KEY = process.env.SCRAPINGBEE_API_KEY;
 
-// Helper: Fetch with Discogs API
-async function discogsAPI(endpoint, params = {}) {
-  const url = new URL(`${DISCOGS_API}${endpoint}`);
-  
-  // Add token if available
-  if (DISCOGS_TOKEN) {
-    url.searchParams.append('token', DISCOGS_TOKEN);
+// In-memory storage
+const userSubscriptions = new Map();
+const userAnalyses = new Map();
+
+// PLANS VALIDÉS - Ne pas modifier sans recalculer la rentabilité !
+const PLANS = {
+  free: { 
+    name: 'Free Preview', 
+    price: 0, 
+    analyses: 0, 
+    items: 50, 
+    stripeId: null 
+  },
+  starter: { 
+    name: 'Starter', 
+    price: 9.99, 
+    analyses: 10, 
+    items: 1000, 
+    stripeId: process.env.STRIPE_PRICE_STARTER || 'price_1ScGpXB2OrJ9THG7O30zKNLW'
+  },
+  pro: { 
+    name: 'Pro', 
+    price: 19.99, 
+    analyses: 30, 
+    items: 2000, 
+    stripeId: process.env.STRIPE_PRICE_PRO || 'price_1ScGqYB2OrJ9THG7AEOjfnVs'
+  },
+  collector: { 
+    name: 'Collector', 
+    price: 39.99, 
+    analyses: 100, 
+    items: 5000, 
+    stripeId: process.env.STRIPE_PRICE_COLLECTOR || 'price_1ScGrNB2OrJ9THG78TJ45CRc'
   }
-  
-  // Add other params
-  Object.keys(params).forEach(key => {
-    url.searchParams.append(key, params[key]);
-  });
-
-  const response = await fetch(url.toString(), {
-    headers: {
-      'User-Agent': 'WantlistOptimizer/2.0'
-    }
-  });
-
-  if (!response.ok) {
-    throw new Error(`Discogs API error: ${response.status}`);
-  }
-
-  return response.json();
-}
-
-// Helper: Fisher-Yates shuffle
-function shuffleArray(array) {
-  const shuffled = [...array];
-  for (let i = shuffled.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
-  }
-  return shuffled;
-}
+};
 
 // Status endpoint
-app.get('/status', async (req, res) => {
-  const hasToken = !!DISCOGS_TOKEN;
-  const rateLimit = hasToken ? 1000 : 60;
-  
+app.get('/status', (req, res) => {
   res.json({
     status: 'ok',
-    hasToken,
-    rateLimit: {
-      max: rateLimit,
-      used: 0,
-      available: rateLimit
-    },
-    cost: '0€/month 🎉'
+    hasToken: !!DISCOGS_TOKEN,
+    hasScrapingBee: !!SCRAPINGBEE_API_KEY,
+    hasStripe: !!process.env.STRIPE_SECRET_KEY,
+    plans: PLANS
   });
 });
+
+// Stripe: Create checkout session
+app.post('/create-checkout-session', async (req, res) => {
+  try {
+    const { plan, email } = req.body;
+    
+    if (!PLANS[plan] || plan === 'free') {
+      return res.status(400).json({ error: 'Invalid plan' });
+    }
+
+    const session = await stripe.checkout.sessions.create({
+      payment_method_types: ['card'],
+      line_items: [{
+        price: PLANS[plan].stripeId,
+        quantity: 1,
+      }],
+      mode: 'subscription',
+      success_url: `${req.headers.origin}/success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${req.headers.origin}/app`,
+      customer_email: email,
+      metadata: { plan: plan, email: email }
+    });
+
+    res.json({ sessionId: session.id, url: session.url });
+  } catch (error) {
+    console.error('Stripe error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Stripe: Webhook
+app.post('/webhook', express.raw({type: 'application/json'}), async (req, res) => {
+  const sig = req.headers['stripe-signature'];
+  let event;
+
+  try {
+    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
+  } catch (err) {
+    console.error('Webhook error:', err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  switch (event.type) {
+    case 'checkout.session.completed':
+      const session = event.data.object;
+      const email = session.metadata.email;
+      const plan = session.metadata.plan;
+      
+      userSubscriptions.set(email, {
+        plan: plan,
+        startDate: new Date(),
+        stripeCustomerId: session.customer,
+        status: 'active'
+      });
+      
+      console.log(`✅ New subscription: ${email} → ${plan}`);
+      break;
+
+    case 'customer.subscription.deleted':
+      const customer = event.data.object.customer;
+      for (let [email, sub] of userSubscriptions.entries()) {
+        if (sub.stripeCustomerId === customer) {
+          sub.status = 'cancelled';
+          console.log(`❌ Subscription cancelled: ${email}`);
+        }
+      }
+      break;
+  }
+
+  res.json({received: true});
+});
+
+// Check subscription
+app.post('/check-subscription', (req, res) => {
+  const { email } = req.body;
+  
+  const subscription = userSubscriptions.get(email);
+  
+  if (!subscription || subscription.status !== 'active') {
+    return res.json({ plan: 'free', analyses: userAnalyses.get(email) || [] });
+  }
+
+  const analyses = userAnalyses.get(email) || [];
+  const currentMonth = new Date().getMonth();
+  const monthlyAnalyses = analyses.filter(a => new Date(a.date).getMonth() === currentMonth);
+
+  res.json({
+    plan: subscription.plan,
+    analysesUsed: monthlyAnalyses.length,
+    analysesLimit: PLANS[subscription.plan].analyses,
+    analyses: analyses
+  });
+});
+
+// Helper: Shuffle array (Fisher-Yates)
+function shuffleArray(array) {
+  const arr = [...array];
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
 
 // Main analyze endpoint
 app.all('/analyze', async (req, res) => {
   const startTime = Date.now();
   
-  // Accept both GET and POST
   const username = req.query.username || req.body.username;
-  const plan = req.query.plan || req.body.plan || 'free';
-
-
+  const email = req.query.email || req.body.email;
+  
   if (!username) {
     return res.status(400).json({ error: 'Username is required' });
   }
 
-  console.log(`\n🎵 ===================================`);
-  console.log(`📊 New Analysis Request`);
-  console.log(`👤 Username: ${username}`);
-  console.log(`💎 Plan: ${plan.toUpperCase()}`);
-  console.log(`🎵 ===================================\n`);
+  console.log(`\n🎵 Analysis Request: ${username}`);
 
   try {
-    // Plan limits
-    const limits = {
-      free: 200,
-      pro: 1000,
-      collector: Infinity
-    };
-    const maxItems = limits[plan] || limits.free;
+    // Determine user plan and limits
+    let userPlan = 'free';
+    let itemsLimit = 50;
+    
+    if (email) {
+      const subscription = userSubscriptions.get(email);
+      if (subscription && subscription.status === 'active') {
+        userPlan = subscription.plan;
+        itemsLimit = PLANS[userPlan].items;
+        
+        // Check monthly limit
+        const analyses = userAnalyses.get(email) || [];
+        const currentMonth = new Date().getMonth();
+        const monthlyAnalyses = analyses.filter(a => new Date(a.date).getMonth() === currentMonth);
+        
+        if (PLANS[userPlan].analyses > 0 && monthlyAnalyses.length >= PLANS[userPlan].analyses) {
+          return res.status(429).json({ 
+            error: 'Monthly analysis limit reached',
+            limit: PLANS[userPlan].analyses,
+            used: monthlyAnalyses.length,
+            plan: userPlan
+          });
+        }
+      }
+    }
+
+    console.log(`💎 Plan: ${userPlan} (limit: ${itemsLimit} items)`);
 
     // Step 1: Fetch wantlist
-    console.log(`📥 Fetching wantlist for ${username}...`);
-    
     let allWants = [];
     let page = 1;
     let hasMore = true;
 
     while (hasMore) {
-      const data = await discogsAPI(`/users/${username}/wants`, {
-        page,
-        per_page: 100
-      });
-
-      allWants = allWants.concat(data.wants);
+      const wantlistUrl = `${DISCOGS_API}/users/${username}/wants?page=${page}&per_page=100`;
+      const headers = { 'User-Agent': 'WantlistOptimizer/3.0' };
       
-      if (data.pagination.page >= data.pagination.pages) {
-        hasMore = false;
-      } else {
-        page++;
+      if (DISCOGS_TOKEN) {
+        headers['Authorization'] = `Discogs token=${DISCOGS_TOKEN}`;
       }
+
+      const response = await fetch(wantlistUrl, { headers });
+      
+      if (!response.ok) {
+        throw new Error(`Failed to fetch wantlist: ${response.status}`);
+      }
+      
+      const data = await response.json();
+      allWants = allWants.concat(data.wants || []);
+      
+      hasMore = data.pagination && data.pagination.page < data.pagination.pages;
+      page++;
     }
+
+    console.log(`✅ Wantlist: ${allWants.length} items`);
 
     if (allWants.length === 0) {
-      return res.status(404).json({ error: 'Wantlist is empty' });
+      return res.json({
+        success: true,
+        message: 'No items in wantlist',
+        username: username,
+        totalItems: 0,
+        sellers: []
+      });
     }
 
-    console.log(`✅ Wantlist loaded: ${allWants.length} total items`);
-
-    // Step 2: Apply randomization and limits
+    // Step 2: TOUJOURS randomiser (tous les plans)
     let wantsToAnalyze = allWants;
-    let wasRandomized = false;
+    let isPreview = (userPlan === 'free');
 
-    if (plan !== 'collector' && allWants.length > maxItems) {
-      console.log(`🎲 Randomizing ${maxItems} items from ${allWants.length} total`);
-      wantsToAnalyze = shuffleArray(allWants).slice(0, maxItems);
-      wasRandomized = true;
-    } else if (allWants.length > maxItems) {
-      wantsToAnalyze = allWants.slice(0, maxItems);
+    if (allWants.length > itemsLimit) {
+      console.log(`🎲 Selecting ${itemsLimit} random items from ${allWants.length}`);
+      wantsToAnalyze = shuffleArray(allWants).slice(0, itemsLimit);
+    } else {
+      console.log(`🎲 Randomizing all ${allWants.length} items`);
+      wantsToAnalyze = shuffleArray(allWants);
     }
 
     console.log(`🔍 Analyzing ${wantsToAnalyze.length} items...`);
 
-    // Step 3: Fetch marketplace listings for each item
+    // Step 3: Scrape marketplace with ScrapingBee
     const vendorMap = {};
-    const itemDetails = [];
     let processedCount = 0;
 
     for (const want of wantsToAnalyze) {
@@ -154,258 +273,107 @@ app.all('/analyze', async (req, res) => {
         const releaseTitle = want.basic_information.title;
         const releaseArtist = want.basic_information.artists?.[0]?.name || 'Unknown';
 
-        // Build the marketplace URL directly
-        const marketplaceUrl = `${DISCOGS_API}/marketplace/search?release_id=${releaseId}&per_page=100`;
-        
-        const headers = {
-          'User-Agent': 'WantlistOptimizer/2.0'
-        };
-        
-        if (DISCOGS_TOKEN) {
-          headers['Authorization'] = `Discogs token=${DISCOGS_TOKEN}`;
-        }
+        const discogsMarketplaceUrl = `https://www.discogs.com/sell/list?release_id=${releaseId}&ev=rb`;
+        const scrapingBeeUrl = `https://app.scrapingbee.com/api/v1/?api_key=${SCRAPINGBEE_API_KEY}&url=${encodeURIComponent(discogsMarketplaceUrl)}&render_js=false`;
 
-        const response = await fetch(marketplaceUrl, { headers });
+        const response = await fetch(scrapingBeeUrl);
         
         if (!response.ok) {
-          throw new Error(`Discogs API error: ${response.status}`);
+          console.error(`❌ ScrapingBee error: ${response.status}`);
+          continue;
         }
         
-        const marketplaceData = await response.json();
-        const listings = marketplaceData.results || [];
+        const html = await response.text();
 
-        // Count items per vendor
-        listings.forEach(listing => {
-          const vendorName = listing.seller?.username;
-          if (!vendorName) return;
+        const sellerMatches = html.matchAll(/data-seller-username="([^"]+)"/g);
+        const priceMatches = html.matchAll(/data-price="([^"]+)"/g);
+        
+        const sellers = Array.from(sellerMatches).map(m => m[1]);
+        const prices = Array.from(priceMatches).map(m => parseFloat(m[1]));
 
-          if (!vendorMap[vendorName]) {
-            vendorMap[vendorName] = {
-              username: vendorName,
+        sellers.forEach((seller, idx) => {
+          if (!vendorMap[seller]) {
+            vendorMap[seller] = {
+              username: seller,
               count: 0,
               items: [],
               totalPrice: 0
             };
           }
 
-          vendorMap[vendorName].count++;
-          vendorMap[vendorName].items.push({
+          vendorMap[seller].count++;
+          vendorMap[seller].items.push({
             title: releaseTitle,
             artist: releaseArtist,
-            price: listing.price?.value || 0,
-            condition: listing.condition || 'Unknown'
+            price: prices[idx] || 0
           });
-          vendorMap[vendorName].totalPrice += (listing.price?.value || 0);
+          vendorMap[seller].totalPrice += (prices[idx] || 0);
         });
 
-        itemDetails.push({
-          id: releaseId,
-          title: releaseTitle,
-          artist: releaseArtist,
-          listingsFound: listings.length
-        });
-
-        // Rate limiting: 1000 req/min = ~60ms between requests
-        await new Promise(resolve => setTimeout(resolve, 70));
+        await new Promise(resolve => setTimeout(resolve, 100));
 
       } catch (error) {
-        console.error(`❌ Error fetching item ${want.basic_information.id}:`, error.message);
+        console.error(`❌ Error: ${error.message}`);
       }
     }
 
-    console.log(`✅ Analysis complete!`);
-
-    // Step 4: Sort vendors by count
-    const vendors = Object.values(vendorMap)
+    // Step 4: Sort and format results
+    const sortedSellers = Object.values(vendorMap)
       .sort((a, b) => b.count - a.count)
-      .map((vendor, index) => ({
-        rank: index + 1,
-        username: vendor.username,
-        count: vendor.count,
-        percentage: ((vendor.count / wantsToAnalyze.length) * 100).toFixed(1),
-        averagePrice: (vendor.totalPrice / vendor.count).toFixed(2),
-        totalPrice: vendor.totalPrice.toFixed(2),
-        estimatedSavings: (15 * (vendor.count - 1)).toFixed(2), // $15 shipping saved per combined item
-        items: vendor.items.slice(0, 10) // Top 10 items
-      }));
+      .slice(0, isPreview ? 3 : 20);
+
+    // Lock data for FREE preview
+    if (isPreview) {
+      sortedSellers.forEach(seller => {
+        seller.items = [];
+        seller.totalPrice = 0;
+        seller.isLocked = true;
+      });
+    }
 
     const duration = ((Date.now() - startTime) / 1000).toFixed(1);
 
-    console.log(`\n🎉 Results:`);
-    console.log(`   Top vendor: ${vendors[0]?.username} with ${vendors[0]?.count} items`);
-    console.log(`   Total vendors found: ${vendors.length}`);
-    console.log(`   Processing time: ${duration}s`);
-    console.log(`🎵 ===================================\n`);
+    console.log(`✅ Complete in ${duration}s\n`);
 
-    // Step 5: Return results
-    res.json({
-      success: true,
-      username,
-      plan,
-      totalWants: allWants.length,
-      analyzedWants: wantsToAnalyze.length,
-      randomized: wasRandomized,
-      processingTime: `${duration}s`,
-      topVendor: vendors[0] || null,
-      vendors: vendors.slice(0, 50),
-      estimatedSavings: vendors[0]?.estimatedSavings || 0,
-      stats: {
-        totalSellers: vendors.length,
-        avgItemsPerSeller: vendors.length > 0 
-          ? (vendors.reduce((sum, v) => sum + v.count, 0) / vendors.length).toFixed(1)
-          : 0,
-        bestSellerHas: vendors[0] 
-          ? `${vendors[0].count}/${wantsToAnalyze.length} items (${vendors[0].percentage}%)`
-          : 'N/A'
-      },
-      message: wasRandomized 
-        ? `Analyzed ${wantsToAnalyze.length} random items from your ${allWants.length} item wantlist. Results will vary each search. Upgrade to COLLECTOR to analyze ALL items and find THE optimal seller.`
-        : null
-    });
-
-  } catch (error) {
-    console.error('❌ Analysis error:', error);
-    res.status(500).json({ 
-      error: 'Analysis failed', 
-      details: error.message 
-    });
-  }
-});
-
-// Stripe: Create checkout session
-app.post('/create-checkout-session', async (req, res) => {
-  const { plan, userEmail, userId } = req.body;
-
-  if (!plan || !userEmail) {
-    return res.status(400).json({ error: 'Missing required fields' });
-  }
-
-  const priceIds = {
-    pro: process.env.STRIPE_PRO_PRICE_ID,
-    collector: process.env.STRIPE_COLLECTOR_PRICE_ID
-  };
-
-  const priceId = priceIds[plan];
-  if (!priceId) {
-    return res.status(400).json({ error: 'Invalid plan' });
-  }
-
-  try {
-    const session = await stripe.checkout.sessions.create({
-      payment_method_types: ['card'],
-      line_items: [{
-        price: priceId,
-        quantity: 1,
-      }],
-      mode: 'subscription',
-      success_url: `${process.env.FRONTEND_URL}/success?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${process.env.FRONTEND_URL}/#pricing`,
-      customer_email: userEmail,
-      client_reference_id: userId,
-      metadata: {
-        plan: plan,
-        userId: userId
-      }
-    });
-
-    res.json({ url: session.url });
-  } catch (error) {
-    console.error('Stripe error:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Stripe: Webhook
-app.post('/webhook', express.raw({ type: 'application/json' }), (req, res) => {
-  const sig = req.headers['stripe-signature'];
-  let event;
-
-  try {
-    event = stripe.webhooks.constructEvent(
-      req.body,
-      sig,
-      process.env.STRIPE_WEBHOOK_SECRET
-    );
-  } catch (err) {
-    console.error('Webhook signature verification failed:', err.message);
-    return res.status(400).send(`Webhook Error: ${err.message}`);
-  }
-
-  console.log('Webhook received:', event.type);
-
-  switch (event.type) {
-    case 'checkout.session.completed':
-      const session = event.data.object;
-      console.log('Payment successful for:', session.customer_email);
-      break;
-    case 'customer.subscription.updated':
-    case 'customer.subscription.deleted':
-      console.log('Subscription updated:', event.data.object.id);
-      break;
-    case 'invoice.payment_failed':
-      console.log('Payment failed:', event.data.object.customer_email);
-      break;
-  }
-
-  res.json({ received: true });
-});
-
-// Stripe: Get subscription status
-app.get('/subscription-status', async (req, res) => {
-  const { userId } = req.query;
-  
-  if (!userId) {
-    return res.status(400).json({ error: 'userId required' });
-  }
-
-  try {
-    const subscriptions = await stripe.subscriptions.list({
-      limit: 1,
-      customer: userId
-    });
-
-    if (subscriptions.data.length === 0) {
-      return res.json({ plan: 'free', status: 'inactive' });
+    // Save analysis history
+    if (email) {
+      const analyses = userAnalyses.get(email) || [];
+      analyses.push({
+        username: username,
+        date: new Date(),
+        itemsAnalyzed: wantsToAnalyze.length,
+        totalItems: allWants.length,
+        topSeller: sortedSellers[0]?.username,
+        plan: userPlan
+      });
+      userAnalyses.set(email, analyses);
     }
 
-    const sub = subscriptions.data[0];
     res.json({
-      plan: sub.metadata.plan || 'pro',
-      status: sub.status,
-      currentPeriodEnd: sub.current_period_end
+      success: true,
+      username: username,
+      plan: userPlan,
+      isPreview: isPreview,
+      totalItems: allWants.length,
+      itemsAnalyzed: wantsToAnalyze.length,
+      sellers: sortedSellers,
+      duration: duration
     });
+
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    console.error('❌ Error:', error);
+    res.status(500).json({ 
+      error: error.message,
+      details: 'Analysis failed'
+    });
   }
 });
 
-// Stripe: Create portal session
-app.post('/create-portal-session', async (req, res) => {
-  const { customerId } = req.body;
-
-  try {
-    const session = await stripe.billingPortal.sessions.create({
-      customer: customerId,
-      return_url: process.env.FRONTEND_URL,
-    });
-
-    res.json({ url: session.url });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Start server
 app.listen(PORT, () => {
-  const hasToken = !!DISCOGS_TOKEN;
-  const rateLimit = hasToken ? 1000 : 60;
-  
-  console.log('\n🎵 ===================================');
-  console.log('🚀 WantlistOptimizer API v2.0');
-  console.log('🎵 ===================================');
+  console.log(`\n🎵 WantlistOptimizer API v3.0`);
   console.log(`📡 Server: http://localhost:${PORT}`);
-  console.log(`💰 Cost: 0€/month (Discogs API direct)`);
-  console.log(`⚡ Rate: ${rateLimit} req/min`);
-  console.log(`🔑 Token: ${hasToken ? '✅ Active' : '⚠️  Missing (performance degraded)'}`);
-  console.log('🎵 ===================================\n');
+  console.log(`🔑 Discogs: ${DISCOGS_TOKEN ? '✅' : '❌'}`);
+  console.log(`🐝 ScrapingBee: ${SCRAPINGBEE_API_KEY ? '✅' : '❌'}`);
+  console.log(`💳 Stripe: ${process.env.STRIPE_SECRET_KEY ? '✅' : '❌'}\n`);
 });
+EOF
