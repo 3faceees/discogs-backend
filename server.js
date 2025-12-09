@@ -40,24 +40,24 @@ const PLANS = {
   },
   starter: { 
     name: 'Starter', 
-    price: 9.99, 
-    analyses: 10, 
-    items: 1000, 
-    stripeId: process.env.STRIPE_PRICE_STARTER || 'price_1ScGpXB2OrJ9THG7O30zKNLW'
+    price: 4.99, 
+    analyses: 8, 
+    items: 500, 
+    stripeId: process.env.STRIPE_PRICE_STARTER
   },
   pro: { 
     name: 'Pro', 
-    price: 19.99, 
-    analyses: 30, 
+    price: 12.99, 
+    analyses: 15, 
     items: 2000, 
-    stripeId: process.env.STRIPE_PRICE_PRO || 'price_1ScGqYB2OrJ9THG7AEOjfnVs'
+    stripeId: process.env.STRIPE_PRICE_PRO
   },
   collector: { 
     name: 'Collector', 
-    price: 39.99, 
-    analyses: 100, 
+    price: 24.99, 
+    analyses: 25, 
     items: 5000, 
-    stripeId: process.env.STRIPE_PRICE_COLLECTOR || 'price_1ScGrNB2OrJ9THG78TJ45CRc'
+    stripeId: process.env.STRIPE_PRICE_COLLECTOR
   }
 };
 
