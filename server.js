@@ -1,4 +1,3 @@
-cat > server.js << 'EOF'
 const express = require('express');
 const cors = require('cors');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
@@ -13,11 +12,9 @@ const DISCOGS_TOKEN = process.env.DISCOGS_TOKEN;
 const DISCOGS_API = 'https://api.discogs.com';
 const SCRAPINGBEE_API_KEY = process.env.SCRAPINGBEE_API_KEY;
 
-// In-memory storage
 const userSubscriptions = new Map();
 const userAnalyses = new Map();
 
-// PLANS VALIDÉS - Ne pas modifier sans recalculer la rentabilité !
 const PLANS = {
   free: { 
     name: 'Free Preview', 
@@ -49,7 +46,6 @@ const PLANS = {
   }
 };
 
-// Status endpoint
 app.get('/status', (req, res) => {
   res.json({
     status: 'ok',
@@ -60,7 +56,6 @@ app.get('/status', (req, res) => {
   });
 });
 
-// Stripe: Create checkout session
 app.post('/create-checkout-session', async (req, res) => {
   try {
     const { plan, email } = req.body;
@@ -89,7 +84,6 @@ app.post('/create-checkout-session', async (req, res) => {
   }
 });
 
-// Stripe: Webhook
 app.post('/webhook', express.raw({type: 'application/json'}), async (req, res) => {
   const sig = req.headers['stripe-signature'];
   let event;
@@ -131,7 +125,6 @@ app.post('/webhook', express.raw({type: 'application/json'}), async (req, res) =
   res.json({received: true});
 });
 
-// Check subscription
 app.post('/check-subscription', (req, res) => {
   const { email } = req.body;
   
@@ -153,7 +146,6 @@ app.post('/check-subscription', (req, res) => {
   });
 });
 
-// Helper: Shuffle array (Fisher-Yates)
 function shuffleArray(array) {
   const arr = [...array];
   for (let i = arr.length - 1; i > 0; i--) {
@@ -163,7 +155,6 @@ function shuffleArray(array) {
   return arr;
 }
 
-// Main analyze endpoint
 app.all('/analyze', async (req, res) => {
   const startTime = Date.now();
   
@@ -177,7 +168,6 @@ app.all('/analyze', async (req, res) => {
   console.log(`\n🎵 Analysis Request: ${username}`);
 
   try {
-    // Determine user plan and limits
     let userPlan = 'free';
     let itemsLimit = 50;
     
@@ -187,7 +177,6 @@ app.all('/analyze', async (req, res) => {
         userPlan = subscription.plan;
         itemsLimit = PLANS[userPlan].items;
         
-        // Check monthly limit
         const analyses = userAnalyses.get(email) || [];
         const currentMonth = new Date().getMonth();
         const monthlyAnalyses = analyses.filter(a => new Date(a.date).getMonth() === currentMonth);
@@ -205,7 +194,6 @@ app.all('/analyze', async (req, res) => {
 
     console.log(`💎 Plan: ${userPlan} (limit: ${itemsLimit} items)`);
 
-    // Step 1: Fetch wantlist
     let allWants = [];
     let page = 1;
     let hasMore = true;
@@ -243,7 +231,6 @@ app.all('/analyze', async (req, res) => {
       });
     }
 
-    // Step 2: TOUJOURS randomiser (tous les plans)
     let wantsToAnalyze = allWants;
     let isPreview = (userPlan === 'free');
 
@@ -257,7 +244,6 @@ app.all('/analyze', async (req, res) => {
 
     console.log(`🔍 Analyzing ${wantsToAnalyze.length} items...`);
 
-    // Step 3: Scrape marketplace with ScrapingBee
     const vendorMap = {};
     let processedCount = 0;
 
@@ -317,12 +303,10 @@ app.all('/analyze', async (req, res) => {
       }
     }
 
-    // Step 4: Sort and format results
     const sortedSellers = Object.values(vendorMap)
       .sort((a, b) => b.count - a.count)
       .slice(0, isPreview ? 3 : 20);
 
-    // Lock data for FREE preview
     if (isPreview) {
       sortedSellers.forEach(seller => {
         seller.items = [];
@@ -335,7 +319,6 @@ app.all('/analyze', async (req, res) => {
 
     console.log(`✅ Complete in ${duration}s\n`);
 
-    // Save analysis history
     if (email) {
       const analyses = userAnalyses.get(email) || [];
       analyses.push({
@@ -376,4 +359,3 @@ app.listen(PORT, () => {
   console.log(`🐝 ScrapingBee: ${SCRAPINGBEE_API_KEY ? '✅' : '❌'}`);
   console.log(`💳 Stripe: ${process.env.STRIPE_SECRET_KEY ? '✅' : '❌'}\n`);
 });
-EOF
