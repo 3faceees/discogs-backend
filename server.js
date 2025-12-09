@@ -68,9 +68,13 @@ app.get('/status', async (req, res) => {
 });
 
 // Main analyze endpoint
-app.post('/analyze', async (req, res) => {
+app.all('/analyze', async (req, res) => {
   const startTime = Date.now();
-  const { username, plan = 'free' } = req.body;
+  
+  // Accept both GET and POST
+  const username = req.query.username || req.body.username;
+  const plan = req.query.plan || req.body.plan || 'free';
+
 
   if (!username) {
     return res.status(400).json({ error: 'Username is required' });
