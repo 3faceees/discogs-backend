@@ -58,13 +58,9 @@ app.get('/status', (req, res) => {
 
 app.post('/create-checkout-session', async (req, res) => {
   try {
-    const { plan, email } = req.body;
+    const { plan } = req.body;
     
-    console.log('📧 Checkout request:', { plan, email });
-    
-    if (!email) {
-      return res.status(400).json({ error: 'Email is required' });
-    }
+    console.log('📧 Checkout request:', { plan });
     
     if (!PLANS[plan] || plan === 'free') {
       return res.status(400).json({ error: 'Invalid plan' });
@@ -79,8 +75,7 @@ app.post('/create-checkout-session', async (req, res) => {
       mode: 'subscription',
       success_url: `${req.headers.origin}/success?session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: `${req.headers.origin}/#pricing`,
-      customer_email: email,
-      metadata: { plan: plan, email: email }
+      metadata: { plan: plan }
     });
 
     console.log('✅ Stripe session created:', session.id);
@@ -106,17 +101,18 @@ app.post('/webhook', express.raw({type: 'application/json'}), async (req, res) =
   switch (event.type) {
     case 'checkout.session.completed':
       const session = event.data.object;
-      const email = session.metadata.email;
+      const email = session.customer_email || session.customer_details?.email;
       const plan = session.metadata.plan;
       
-      userSubscriptions.set(email, {
-        plan: plan,
-        startDate: new Date(),
-        stripeCustomerId: session.customer,
-        status: 'active'
-      });
-      
-      console.log(`✅ New subscription: ${email} → ${plan}`);
+      if (email) {
+        userSubscriptions.set(email, {
+          plan: plan,
+          startDate: new Date(),
+          stripeCustomerId: session.customer,
+          status: 'active'
+        });
+        console.log(`✅ New subscription: ${email} → ${plan}`);
+      }
       break;
 
     case 'customer.subscription.deleted':
@@ -254,7 +250,7 @@ app.all('/analyze', async (req, res) => {
 
     console.log(`🔍 Analyzing ${wantsToAnalyze.length} items...`);
 
-    // Scrape marketplace
+    // Scrape marketplace with MULTIPLE PATTERNS
     const vendorMap = {};
     let processedCount = 0;
 
@@ -282,22 +278,22 @@ app.all('/analyze', async (req, res) => {
         
         const html = await response.text();
 
-        // FIX: Multiple patterns to find sellers
+        // FIX: Try MULTIPLE patterns to find sellers
         let sellers = [];
         
-        // Pattern 1: data-seller-username
+        // Pattern 1: data-seller-username (most reliable)
         const pattern1 = html.matchAll(/data-seller-username="([^"]+)"/g);
         sellers = Array.from(pattern1).map(m => m[1]);
         
         // Pattern 2: /seller/ links (fallback)
         if (sellers.length === 0) {
-          const pattern2 = html.matchAll(/\/seller\/([^\/"\s]+)/g);
+          const pattern2 = html.matchAll(/href="\/seller\/([^\/"\s?]+)/g);
           sellers = Array.from(pattern2).map(m => m[1]);
         }
         
-        // Pattern 3: user profiles (fallback)
+        // Pattern 3: seller_info class (another fallback)
         if (sellers.length === 0) {
-          const pattern3 = html.matchAll(/\/user\/([^\/"\s]+)/g);
+          const pattern3 = html.matchAll(/class="seller_info"[^>]*>[\s\S]*?href="\/seller\/([^"]+)"/g);
           sellers = Array.from(pattern3).map(m => m[1]);
         }
 
@@ -308,10 +304,13 @@ app.all('/analyze', async (req, res) => {
         if (sellers.length > 0) {
           console.log(`✅ Found ${sellers.length} sellers for: ${releaseTitle}`);
         } else {
-          console.log(`⚠️ No sellers for: ${releaseTitle}`);
+          console.log(`⚠️ No sellers found for: ${releaseTitle}`);
         }
 
-        sellers.forEach((seller, idx) => {
+        // Deduplicate sellers and add to vendorMap
+        const uniqueSellers = [...new Set(sellers)];
+        
+        uniqueSellers.forEach((seller, idx) => {
           if (!vendorMap[seller]) {
             vendorMap[seller] = {
               username: seller,
@@ -342,7 +341,7 @@ app.all('/analyze', async (req, res) => {
       .sort((a, b) => b.count - a.count)
       .slice(0, isPreview ? 3 : 20);
 
-    console.log(`📊 Total sellers found: ${sortedSellers.length}`);
+    console.log(`📊 Total unique sellers found: ${sortedSellers.length}`);
 
     // Lock data for FREE preview
     if (isPreview) {
@@ -354,7 +353,7 @@ app.all('/analyze', async (req, res) => {
     }
 
     const duration = ((Date.now() - startTime) / 1000).toFixed(1);
-    console.log(`✅ Complete in ${duration}s\n`);
+    console.log(`✅ Analysis complete in ${duration}s\n`);
 
     // Save analysis
     if (email) {
