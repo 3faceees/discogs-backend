@@ -17,7 +17,7 @@ const SCRAPINGBEE_API_KEY = process.env.SCRAPINGBEE_API_KEY;
 
 const userSubscriptions = new Map();
 const userAnalyses = new Map();
-const emailAnalyses = new Map(); // email → [{date, username}]
+const emailAnalyses = new Map();
 
 // Condition hierarchy
 const CONDITIONS = { 'P': 1, 'F': 2, 'G': 3, 'G+': 4, 'VG': 5, 'VG+': 6, 'NM': 7, 'M': 8 };
@@ -198,7 +198,7 @@ app.post('/check-subscription', (req, res) => {
   });
 });
 
-// Scrape marketplace avec Cheerio (la version qui marche!)
+// Scrape marketplace avec Cheerio
 async function scrapeMarketplace(releaseId, minCondition = null, regionFilter = null) {
   try {
     const targetUrl = `https://www.discogs.com/sell/release/${releaseId}?sort=price,asc`;
@@ -281,6 +281,8 @@ app.all('/analyze', async (req, res) => {
   
   const username = req.query.username || req.body.username;
   const email = req.query.email || req.body.email;
+  const minCondition = req.query.minCondition || req.body.minCondition || null;
+  const region = req.query.region || req.body.region || null;
   
   if (!username) {
     return res.status(400).json({ error: 'Username is required' });
