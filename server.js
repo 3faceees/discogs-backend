@@ -154,12 +154,24 @@ app.all('/analyze', async (req, res) => {
         const releaseTitle = want.basic_information.title;
         const releaseArtist = want.basic_information.artists?.[0]?.name || 'Unknown';
 
-        // Fetch marketplace listings
-        const marketplaceData = await discogsAPI('/marketplace/listings', {
-          release_id: releaseId,
-          per_page: 100
-        });
+        // Build the marketplace URL directly
+        const marketplaceUrl = `${DISCOGS_API}/marketplace/search?release_id=${releaseId}&per_page=100`;
+        
+        const headers = {
+          'User-Agent': 'WantlistOptimizer/2.0'
+        };
+        
+        if (DISCOGS_TOKEN) {
+          headers['Authorization'] = `Discogs token=${DISCOGS_TOKEN}`;
+        }
 
+        const response = await fetch(marketplaceUrl, { headers });
+        
+        if (!response.ok) {
+          throw new Error(`Discogs API error: ${response.status}`);
+        }
+        
+        const marketplaceData = await response.json();
         const listings = marketplaceData.results || [];
 
         // Count items per vendor
