@@ -278,23 +278,36 @@ app.all('/analyze', async (req, res) => {
         
         const html = await response.text();
 
+        // DEBUG: Log a snippet to see what we're getting
+        if (processedCount === 1) {
+          console.log(`📄 HTML snippet (first 500 chars): ${html.substring(0, 500)}`);
+        }
+
         // FIX: Try MULTIPLE patterns to find sellers
         let sellers = [];
         
         // Pattern 1: data-seller-username (most reliable)
-        const pattern1 = html.matchAll(/data-seller-username="([^"]+)"/g);
+        let pattern1 = html.matchAll(/data-seller-username="([^"]+)"/g);
         sellers = Array.from(pattern1).map(m => m[1]);
         
         // Pattern 2: /seller/ links (fallback)
         if (sellers.length === 0) {
-          const pattern2 = html.matchAll(/href="\/seller\/([^\/"\s?]+)/g);
-          sellers = Array.from(pattern2).map(m => m[1]);
+          let pattern2 = html.matchAll(/\/seller\/([a-zA-Z0-9_-]+)/g);
+          const allMatches = Array.from(pattern2).map(m => m[1]);
+          // Deduplicate
+          sellers = [...new Set(allMatches)];
         }
         
-        // Pattern 3: seller_info class (another fallback)
+        // Pattern 3: Look for seller in any href attribute
         if (sellers.length === 0) {
-          const pattern3 = html.matchAll(/class="seller_info"[^>]*>[\s\S]*?href="\/seller\/([^"]+)"/g);
+          let pattern3 = html.matchAll(/href=["']\/seller\/([^"'\s\/]+)/g);
           sellers = Array.from(pattern3).map(m => m[1]);
+        }
+
+        // Pattern 4: Data attributes
+        if (sellers.length === 0) {
+          let pattern4 = html.matchAll(/data-seller[^=]*=["']([^"']+)["']/g);
+          sellers = Array.from(pattern4).map(m => m[1]);
         }
 
         // Get prices
