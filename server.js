@@ -155,7 +155,7 @@ app.all('/analyze', async (req, res) => {
         const releaseArtist = want.basic_information.artists?.[0]?.name || 'Unknown';
 
         // Fetch marketplace listings
-        const marketplaceData = await discogsAPI('/marketplace/search', {
+        const marketplaceData = await discogsAPI('/marketplace/listings', {
           release_id: releaseId,
           per_page: 100
         });
