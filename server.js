@@ -17,6 +17,7 @@ const SCRAPINGBEE_API_KEY = process.env.SCRAPINGBEE_API_KEY;
 
 const userSubscriptions = new Map();
 const userAnalyses = new Map();
+const emailAnalyses = new Map(); // email → [{date, username}]
 
 // Condition hierarchy
 const CONDITIONS = { 'P': 1, 'F': 2, 'G': 3, 'G+': 4, 'VG': 5, 'VG+': 6, 'NM': 7, 'M': 8 };
@@ -280,40 +281,57 @@ app.all('/analyze', async (req, res) => {
   
   const username = req.query.username || req.body.username;
   const email = req.query.email || req.body.email;
-  const minCondition = req.query.minCondition || req.body.minCondition || null;
-  const region = req.query.region || req.body.region || null;
   
   if (!username) {
     return res.status(400).json({ error: 'Username is required' });
   }
+  if (!email) {
+    return res.status(400).json({ error: 'Email is required' });
+  }
 
-  console.log(`\n🎵 Analysis Request: ${username}`);
-  if (minCondition) console.log(`📊 Min condition: ${minCondition}`);
-  if (region) console.log(`🌍 Region filter: ${region}`);
+  console.log(`\n🎵 Analysis Request: ${username} (${email})`);
 
   try {
     let userPlan = 'free';
     let itemsLimit = 50;
     
-    if (email) {
-      const subscription = userSubscriptions.get(email);
-      if (subscription && subscription.status === 'active') {
-        userPlan = subscription.plan;
-        itemsLimit = PLANS[userPlan].items;
-        
-        const analyses = userAnalyses.get(email) || [];
-        const currentMonth = new Date().getMonth();
-        const monthlyAnalyses = analyses.filter(a => new Date(a.date).getMonth() === currentMonth);
-        
-        if (PLANS[userPlan].analyses > 0 && monthlyAnalyses.length >= PLANS[userPlan].analyses) {
-          return res.status(429).json({ 
-            error: 'Monthly analysis limit reached',
-            limit: PLANS[userPlan].analyses,
-            used: monthlyAnalyses.length,
-            plan: userPlan
-          });
-        }
+    const subscription = userSubscriptions.get(email);
+    
+    if (subscription && subscription.status === 'active') {
+      // PAID USER
+      userPlan = subscription.plan;
+      itemsLimit = PLANS[userPlan].items;
+      
+      const analyses = userAnalyses.get(email) || [];
+      const currentMonth = new Date().getMonth();
+      const monthlyAnalyses = analyses.filter(a => new Date(a.date).getMonth() === currentMonth);
+      
+      if (PLANS[userPlan].analyses > 0 && monthlyAnalyses.length >= PLANS[userPlan].analyses) {
+        return res.status(429).json({ 
+          error: 'Monthly analysis limit reached',
+          limit: PLANS[userPlan].analyses,
+          used: monthlyAnalyses.length,
+          plan: userPlan
+        });
       }
+    } else {
+      // FREE USER - Check IP rate limit
+      const userIP = req.headers['x-forwarded-for']?.split(',')[0] || req.socket.remoteAddress;
+      const ipAnalyses = emailAnalyses.get(userIP) || [];
+      const today = new Date().setHours(0, 0, 0, 0);
+      const todayAnalyses = ipAnalyses.filter(a => new Date(a.date).setHours(0, 0, 0, 0) === today);
+      
+      if (todayAnalyses.length >= 3) {
+        return res.status(429).json({ 
+          error: 'Free limit: 3 analyses per day per device. Upgrade for unlimited!',
+          limit: 3,
+          used: todayAnalyses.length
+        });
+      }
+      
+      // Save IP analysis
+      ipAnalyses.push({ date: new Date(), username, email });
+      emailAnalyses.set(userIP, ipAnalyses);
     }
 
     console.log(`💎 Plan: ${userPlan} (limit: ${itemsLimit} items)`);
