@@ -1,6 +1,9 @@
-const express = require('express');
-const cors = require('cors');
-const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
+import express from 'express';
+import cors from 'cors';
+import Stripe from 'stripe';
+import * as cheerio from 'cheerio';
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
 const app = express();
 const PORT = process.env.PORT || 8080;
@@ -14,6 +17,18 @@ const SCRAPINGBEE_API_KEY = process.env.SCRAPINGBEE_API_KEY;
 
 const userSubscriptions = new Map();
 const userAnalyses = new Map();
+
+// Condition hierarchy
+const CONDITIONS = { 'P': 1, 'F': 2, 'G': 3, 'G+': 4, 'VG': 5, 'VG+': 6, 'NM': 7, 'M': 8 };
+
+// Region mapping
+const REGIONS = {
+  'us': ['United States', 'USA', 'US'],
+  'uk': ['United Kingdom', 'UK', 'Great Britain'],
+  'eu': ['Germany', 'France', 'Italy', 'Spain', 'Netherlands', 'Belgium', 'Austria', 'Poland', 'Sweden', 'Portugal', 'Greece', 'Ireland'],
+  'jp': ['Japan'],
+  'au': ['Australia', 'New Zealand']
+};
 
 const PLANS = {
   free: { 
@@ -46,6 +61,38 @@ const PLANS = {
   }
 };
 
+// Parse condition from text
+function parseCondition(text) {
+  if (!text) return null;
+  text = text.toUpperCase().trim();
+  if (text.includes('MINT') && !text.includes('NEAR')) return 'M';
+  if (text.includes('NEAR MINT') || text === 'NM') return 'NM';
+  if (text.includes('VG+')) return 'VG+';
+  if (text.includes('VG')) return 'VG';
+  if (text.includes('G+')) return 'G+';
+  if (text.includes('GOOD') || text === 'G') return 'G';
+  if (text.includes('FAIR') || text === 'F') return 'F';
+  if (text.includes('POOR') || text === 'P') return 'P';
+  return null;
+}
+
+// Check if seller matches region filter
+function matchesRegion(sellerLocation, regionFilter) {
+  if (!regionFilter || !sellerLocation) return true;
+  const countries = REGIONS[regionFilter.toLowerCase()];
+  if (!countries) return true;
+  return countries.some(c => sellerLocation.toLowerCase().includes(c.toLowerCase()));
+}
+
+function shuffleArray(array) {
+  const arr = [...array];
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
+
 app.get('/status', (req, res) => {
   res.json({
     status: 'ok',
@@ -60,7 +107,7 @@ app.post('/create-checkout-session', async (req, res) => {
   try {
     const { plan } = req.body;
     
-    console.log('📧 Checkout request:', { plan });
+    console.log('🔧 Checkout request:', { plan });
     
     if (!PLANS[plan] || plan === 'free') {
       return res.status(400).json({ error: 'Invalid plan' });
@@ -150,13 +197,82 @@ app.post('/check-subscription', (req, res) => {
   });
 });
 
-function shuffleArray(array) {
-  const arr = [...array];
-  for (let i = arr.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [arr[i], arr[j]] = [arr[j], arr[i]];
+// Scrape marketplace avec Cheerio (la version qui marche!)
+async function scrapeMarketplace(releaseId, minCondition = null, regionFilter = null) {
+  try {
+    const targetUrl = `https://www.discogs.com/sell/release/${releaseId}?sort=price,asc`;
+    const apiUrl = `https://app.scrapingbee.com/api/v1/?api_key=${SCRAPINGBEE_API_KEY}&url=${encodeURIComponent(targetUrl)}&render_js=false`;
+    
+    const response = await fetch(apiUrl);
+    if (!response.ok) {
+      console.error(`❌ ScrapingBee error: ${response.status}`);
+      return { sellers: [], prices: [] };
+    }
+    
+    const html = await response.text();
+    const $ = cheerio.load(html);
+    const sellers = [];
+    const prices = [];
+    
+    // Parse each listing row
+    $('.shortcut_navigable').each((i, row) => {
+      const $row = $(row);
+      const sellerLink = $row.find('a[href*="/seller/"]').first();
+      const href = sellerLink.attr('href');
+      if (!href) return;
+      
+      const match = href.match(/\/seller\/([^\/]+)/);
+      if (!match) return;
+      
+      const seller = match[1];
+      
+      // Get condition
+      const conditionText = $row.find('.item_condition .condition-label-desktop').first().text() || 
+                           $row.find('.item_condition span').first().text();
+      const condition = parseCondition(conditionText);
+      
+      // Filter by condition if specified
+      if (minCondition && condition && CONDITIONS[condition] < CONDITIONS[minCondition]) {
+        return;
+      }
+      
+      // Get seller location
+      const location = $row.find('.seller_info ul li').last().text().trim();
+      
+      // Filter by region if specified
+      if (!matchesRegion(location, regionFilter)) {
+        return;
+      }
+      
+      // Get price
+      const priceText = $row.find('.price').first().text().trim();
+      const priceMatch = priceText.match(/[\d,.]+/);
+      const price = priceMatch ? parseFloat(priceMatch[0].replace(',', '')) : 0;
+      
+      sellers.push(seller);
+      prices.push(price);
+    });
+
+    // Fallback: simple parsing if no results
+    if (sellers.length === 0) {
+      $('a[href*="/seller/"]').each((i, el) => {
+        const href = $(el).attr('href');
+        if (href) {
+          const match = href.match(/\/seller\/([^\/]+)/);
+          if (match && !sellers.includes(match[1])) {
+            sellers.push(match[1]);
+            prices.push(0);
+          }
+        }
+      });
+    }
+
+    return { sellers, prices };
+    
+  } catch (err) {
+    console.error('Scrape error:', err.message);
+    return { sellers: [], prices: [] };
   }
-  return arr;
 }
 
 app.all('/analyze', async (req, res) => {
@@ -164,12 +280,16 @@ app.all('/analyze', async (req, res) => {
   
   const username = req.query.username || req.body.username;
   const email = req.query.email || req.body.email;
+  const minCondition = req.query.minCondition || req.body.minCondition || null;
+  const region = req.query.region || req.body.region || null;
   
   if (!username) {
     return res.status(400).json({ error: 'Username is required' });
   }
 
   console.log(`\n🎵 Analysis Request: ${username}`);
+  if (minCondition) console.log(`📊 Min condition: ${minCondition}`);
+  if (region) console.log(`🌍 Region filter: ${region}`);
 
   try {
     let userPlan = 'free';
@@ -250,7 +370,7 @@ app.all('/analyze', async (req, res) => {
 
     console.log(`🔍 Analyzing ${wantsToAnalyze.length} items...`);
 
-    // Scrape marketplace with MULTIPLE PATTERNS
+    // Scrape marketplace avec Cheerio
     const vendorMap = {};
     let processedCount = 0;
 
@@ -262,66 +382,11 @@ app.all('/analyze', async (req, res) => {
       }
 
       try {
-        const releaseId = want.basic_information.id;
-        const releaseTitle = want.basic_information.title;
-        const releaseArtist = want.basic_information.artists?.[0]?.name || 'Unknown';
+        const releaseId = want.basic_information?.id || want.id;
+        const releaseTitle = want.basic_information?.title || 'Unknown';
+        const releaseArtist = want.basic_information?.artists?.[0]?.name || 'Unknown';
 
-        const discogsMarketplaceUrl = `https://www.discogs.com/sell/list?release_id=${releaseId}&ev=rb`;
-        const scrapingBeeUrl = `https://app.scrapingbee.com/api/v1/?api_key=${SCRAPINGBEE_API_KEY}&url=${encodeURIComponent(discogsMarketplaceUrl)}&render_js=false`;
-
-        console.log(`🔍 Fetching: ${discogsMarketplaceUrl}`);
-        
-        const response = await fetch(scrapingBeeUrl);
-        
-        if (!response.ok) {
-          console.error(`❌ ScrapingBee HTTP ${response.status} for ${releaseId}`);
-          continue;
-        }
-        
-        const html = await response.text();
-        
-        console.log(`📄 HTML length: ${html.length} chars`);
-
-        // DEBUG: Log snippet for first item only
-        if (processedCount === 1) {
-          console.log(`📄 HTML snippet (first 1000 chars):\n${html.substring(0, 1000)}`);
-          
-          // Check for common patterns
-          const hasDataSeller = html.includes('data-seller');
-          const hasSeller = html.includes('/seller/');
-          const hasShortcut = html.includes('shortcut_navigable');
-          console.log(`🔍 Pattern check: data-seller=${hasDataSeller}, /seller/=${hasSeller}, shortcut=${hasShortcut}`);
-        }
-
-        // Try MULTIPLE patterns
-        let sellers = [];
-        
-        // Pattern 1: data-seller-username
-        let matches1 = html.matchAll(/data-seller-username="([^"]+)"/g);
-        sellers = Array.from(matches1).map(m => m[1]);
-        if (sellers.length > 0) console.log(`✓ Pattern 1 found ${sellers.length} sellers`);
-        
-        // Pattern 2: /seller/ in href
-        if (sellers.length === 0) {
-          let matches2 = html.matchAll(/href=["']\/seller\/([a-zA-Z0-9_-]+)/g);
-          sellers = [...new Set(Array.from(matches2).map(m => m[1]))];
-          if (sellers.length > 0) console.log(`✓ Pattern 2 found ${sellers.length} sellers`);
-        }
-        
-        // Pattern 3: Any /seller/ reference
-        if (sellers.length === 0) {
-          let matches3 = html.matchAll(/\/seller\/([a-zA-Z0-9_-]+)/g);
-          sellers = [...new Set(Array.from(matches3).map(m => m[1]))].slice(0, 20);
-          if (sellers.length > 0) console.log(`✓ Pattern 3 found ${sellers.length} sellers`);
-        }
-
-        // Pattern 4: Try without render_js (maybe it needs JS?)
-        if (sellers.length === 0 && processedCount === 1) {
-          console.log(`⚠️ No sellers found with render_js=false, this might be the issue!`);
-        }
-
-        const priceMatches = html.matchAll(/data-price="([^"]+)"/g);
-        const prices = Array.from(priceMatches).map(m => parseFloat(m[1]));
+        const { sellers, prices } = await scrapeMarketplace(releaseId, minCondition, region);
 
         if (sellers.length > 0) {
           console.log(`✅ Found ${sellers.length} sellers for: ${releaseTitle}`);
@@ -329,10 +394,8 @@ app.all('/analyze', async (req, res) => {
           console.log(`⚠️ No sellers found for: ${releaseTitle}`);
         }
 
-        // Deduplicate sellers and add to vendorMap
-        const uniqueSellers = [...new Set(sellers)];
-        
-        uniqueSellers.forEach((seller, idx) => {
+        // Add sellers to vendorMap
+        sellers.forEach((seller, idx) => {
           if (!vendorMap[seller]) {
             vendorMap[seller] = {
               username: seller,
@@ -351,7 +414,8 @@ app.all('/analyze', async (req, res) => {
           vendorMap[seller].totalPrice += (prices[idx] || 0);
         });
 
-        await new Promise(resolve => setTimeout(resolve, 150));
+        // Rate limiting
+        await new Promise(resolve => setTimeout(resolve, 300));
 
       } catch (error) {
         console.error(`❌ Error processing item: ${error.message}`);
