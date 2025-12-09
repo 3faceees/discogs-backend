@@ -269,48 +269,57 @@ app.all('/analyze', async (req, res) => {
         const discogsMarketplaceUrl = `https://www.discogs.com/sell/list?release_id=${releaseId}&ev=rb`;
         const scrapingBeeUrl = `https://app.scrapingbee.com/api/v1/?api_key=${SCRAPINGBEE_API_KEY}&url=${encodeURIComponent(discogsMarketplaceUrl)}&render_js=false`;
 
+        console.log(`🔍 Fetching: ${discogsMarketplaceUrl}`);
+        
         const response = await fetch(scrapingBeeUrl);
         
         if (!response.ok) {
-          console.error(`❌ ScrapingBee error for ${releaseId}: ${response.status}`);
+          console.error(`❌ ScrapingBee HTTP ${response.status} for ${releaseId}`);
           continue;
         }
         
         const html = await response.text();
+        
+        console.log(`📄 HTML length: ${html.length} chars`);
 
-        // DEBUG: Log a snippet to see what we're getting
+        // DEBUG: Log snippet for first item only
         if (processedCount === 1) {
-          console.log(`📄 HTML snippet (first 500 chars): ${html.substring(0, 500)}`);
+          console.log(`📄 HTML snippet (first 1000 chars):\n${html.substring(0, 1000)}`);
+          
+          // Check for common patterns
+          const hasDataSeller = html.includes('data-seller');
+          const hasSeller = html.includes('/seller/');
+          const hasShortcut = html.includes('shortcut_navigable');
+          console.log(`🔍 Pattern check: data-seller=${hasDataSeller}, /seller/=${hasSeller}, shortcut=${hasShortcut}`);
         }
 
-        // FIX: Try MULTIPLE patterns to find sellers
+        // Try MULTIPLE patterns
         let sellers = [];
         
-        // Pattern 1: data-seller-username (most reliable)
-        let pattern1 = html.matchAll(/data-seller-username="([^"]+)"/g);
-        sellers = Array.from(pattern1).map(m => m[1]);
+        // Pattern 1: data-seller-username
+        let matches1 = html.matchAll(/data-seller-username="([^"]+)"/g);
+        sellers = Array.from(matches1).map(m => m[1]);
+        if (sellers.length > 0) console.log(`✓ Pattern 1 found ${sellers.length} sellers`);
         
-        // Pattern 2: /seller/ links (fallback)
+        // Pattern 2: /seller/ in href
         if (sellers.length === 0) {
-          let pattern2 = html.matchAll(/\/seller\/([a-zA-Z0-9_-]+)/g);
-          const allMatches = Array.from(pattern2).map(m => m[1]);
-          // Deduplicate
-          sellers = [...new Set(allMatches)];
+          let matches2 = html.matchAll(/href=["']\/seller\/([a-zA-Z0-9_-]+)/g);
+          sellers = [...new Set(Array.from(matches2).map(m => m[1]))];
+          if (sellers.length > 0) console.log(`✓ Pattern 2 found ${sellers.length} sellers`);
         }
         
-        // Pattern 3: Look for seller in any href attribute
+        // Pattern 3: Any /seller/ reference
         if (sellers.length === 0) {
-          let pattern3 = html.matchAll(/href=["']\/seller\/([^"'\s\/]+)/g);
-          sellers = Array.from(pattern3).map(m => m[1]);
+          let matches3 = html.matchAll(/\/seller\/([a-zA-Z0-9_-]+)/g);
+          sellers = [...new Set(Array.from(matches3).map(m => m[1]))].slice(0, 20);
+          if (sellers.length > 0) console.log(`✓ Pattern 3 found ${sellers.length} sellers`);
         }
 
-        // Pattern 4: Data attributes
-        if (sellers.length === 0) {
-          let pattern4 = html.matchAll(/data-seller[^=]*=["']([^"']+)["']/g);
-          sellers = Array.from(pattern4).map(m => m[1]);
+        // Pattern 4: Try without render_js (maybe it needs JS?)
+        if (sellers.length === 0 && processedCount === 1) {
+          console.log(`⚠️ No sellers found with render_js=false, this might be the issue!`);
         }
 
-        // Get prices
         const priceMatches = html.matchAll(/data-price="([^"]+)"/g);
         const prices = Array.from(priceMatches).map(m => parseFloat(m[1]));
 
