@@ -106,9 +106,9 @@ app.get('/status', (req, res) => {
 
 app.post('/create-checkout-session', async (req, res) => {
   try {
-    const { plan } = req.body;
+    const { plan, clerk_id } = req.body; // Récupérer clerk_id du body
     
-    console.log('🔧 Checkout request:', { plan });
+    console.log('🔧 Checkout request:', { plan, clerk_id: clerk_id ? 'provided' : 'not provided' });
     
     if (!PLANS[plan] || plan === 'free') {
       return res.status(400).json({ error: 'Invalid plan' });
@@ -123,7 +123,10 @@ app.post('/create-checkout-session', async (req, res) => {
       mode: 'subscription',
       success_url: `${req.headers.origin}/success?session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: `${req.headers.origin}/#pricing`,
-      metadata: { plan: plan }
+      metadata: { 
+        plan: plan,
+        clerk_id: clerk_id || null // Passer clerk_id dans les metadata si disponible
+      }
     });
 
     console.log('✅ Stripe session created:', session.id);
